@@ -1,240 +1,83 @@
 'use strict';
 
 const os = require('node:os');
+const dns  = require('node:dns');
 const dgram = require('node:dgram');
 const zlib = require('node:zlib');
+const gzip = require('node:util').promisify(zlib.gzip);
 const crypto = require('node:crypto');
 
 const GELF_VERSION = '1.1';
 const CHUNK_MAGIC_0 = 0x1e;
 const CHUNK_MAGIC_1 = 0x0f;
 
-exports.register = function () {
-    this.cfg = this.load_gelf_config();
+const LogLevel = Object.freeze({
+    EMERG:  0,
+    ALERT:  1,
+    CRIT:   2,
+    ERROR:  3,
+    WARN:   4,
+    NOTICE: 5,
+    INFO:   6,
+    DEBUG:  7,
+});
 
-    // Initialize once per Haraka process.
-    this.register_hook('init_master', 'init_gelf_sender');
-    this.register_hook('init_child', 'init_gelf_sender');
-};
-
-exports.load_gelf_config = function () {
-    const cfg = this.config.get('gelf_udp.ini', {
-        booleans: [
-            '+main.enabled',
-            '+main.compress',
-            '+main.chunk',
-            '+main.log_errors',
-        ],
-    }) || {};
-
-    cfg.main ||= {};
-
-    return {
-        enabled: cfg.main.enabled !== false,
-        host: cfg.main.host || '127.0.0.1',
-        port: Number(cfg.main.port || 12201),
-        compress: cfg.main.compress !== false,
-        chunk: cfg.main.chunk !== false,
-        max_chunk_size: Number(cfg.main.max_chunk_size || 8192),
-        facility: cfg.main.facility || 'haraka',
-        hostname: cfg.main.hostname || os.hostname(),
-        log_errors: cfg.main.log_errors !== false,
-        default_level: Number(cfg.main.default_level || 6), // syslog INFO
-    };
-};
-
-exports.init_gelf_sender = function (next) {
-    if (!this.cfg.enabled) {
-        this.loginfo('GELF UDP disabled');
-        return next();
-    }
-
-    if (!this.server.notes) this.server.notes = {};
-
-    // Avoid reinitializing if both init_master and init_child run in a context
-    // where the helper already exists.
-    if (this.server.notes.gelf_udp) {
-        return next();
-    }
-
-    const socket = dgram.createSocket('udp4');
-    const plugin = this;
-
-    socket.on('error', (err) => {
-        if (plugin.cfg.log_errors) {
-            plugin.logerror(`gelf udp socket error: ${err.message}`);
+function toBool(value, defaultValue)
+{
+    if (typeof value === 'boolean') {
+        return value;
+    } else if (typeof value === 'string') {
+        if (/^(true|yes|1)$/i.test(value)) {
+            return true;
+        } else if (/^(false|no|0)$/i.test(value)) {
+            return false;
         }
-    });
-
-    const sender = {
-        send(message) {
-            return sendGelf(plugin, socket, plugin.cfg, message);
-        },
-
-        debug(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 7,
-                ...extra,
-            });
-        },
-
-        info(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 6,
-                ...extra,
-            });
-        },
-
-        notice(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 5,
-                ...extra,
-            });
-        },
-
-        warning(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 4,
-                ...extra,
-            });
-        },
-
-        error(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 3,
-                ...extra,
-            });
-        },
-
-        critical(shortMessage, extra = {}) {
-            return this.send({
-                short_message: shortMessage,
-                level: 2,
-                ...extra,
-            });
-        },
-
-        close() {
-            try {
-                socket.close();
-            }
-            catch (err) {
-                // ignore
-            }
-        },
-    };
-
-    this.server.notes.gelf_udp = sender;
-    this.loginfo(`GELF UDP sender ready for ${this.cfg.host}:${this.cfg.port}`);
-    next();
-};
-
-function sendGelf(plugin, socket, cfg, message) {
-    const payload = normalizeMessage(cfg, message);
-
-    let buffer = Buffer.from(JSON.stringify(payload), 'utf8');
-
-    if (cfg.compress) {
-        buffer = zlib.gzipSync(buffer);
     }
 
-    if (buffer.length <= cfg.max_chunk_size) {
-        socket.send(buffer, cfg.port, cfg.host, onSend(plugin));
-        return;
-    }
-
-    if (!cfg.chunk) {
-        if (cfg.log_errors) {
-            plugin.logerror(
-                `GELF payload too large (${buffer.length} bytes), chunking disabled`
-            );
-        }
-        return;
-    }
-
-    sendChunked(plugin, socket, cfg, buffer);
+    return defaultValue;
 }
 
-function normalizeMessage(cfg, input) {
-    const msg = { ...input };
+function resolveConfig(plugin, name, main, ovr = {})
+{
+    const out = { ...main };
 
-    const out = {
-        version: GELF_VERSION,
-        host: stringify(msg.host || cfg.hostname),
-        short_message: stringify(
-            msg.short_message || msg.message || 'Haraka event'
-        ),
-        timestamp: normalizeTimestamp(msg.timestamp),
-        level: normalizeLevel(msg.level, cfg.default_level),
-        facility: stringify(msg.facility || cfg.facility),
-    };
+    if ('enabled' in ovr)        out.enabled = toBool(ovr.enabled, true);
+    if ('url' in ovr)            out.url = ovr.url;
+    if ('compress' in ovr)       out.compress = toBool(ovr.compress, true);
+    if ('last' in ovr)           out.last = toBool(ovr.last, false);
+    if ('max_chunk_size' in ovr) out.max_chunk_size = Number(ovr.max_chunk_size);
+    if ('hostname' in ovr)       out.hostname = ovr.hostname;
 
-    if (msg.full_message != null) {
-        out.full_message = stringify(msg.full_message);
-    }
-
-    // Preserve allowed top-level GELF fields if present.
-    for (const key of [
-        'file',
-        'line',
-        '_id', // Graylog ignores _id, but leave caller in control if they pass it.
-    ]) {
-        if (msg[key] != null) out[key] = msg[key];
-    }
-
-    // Convert all remaining custom fields to GELF additional fields (_foo).
-    for (const [key, value] of Object.entries(msg)) {
-        if (value == null) continue;
-
-        if ([
-            'version',
-            'host',
-            'short_message',
-            'message',
-            'full_message',
-            'timestamp',
-            'level',
-            'facility',
-            'file',
-            'line',
-        ].includes(key)) {
-            continue;
-        }
-
-        const normalizedKey = key.startsWith('_') ? key : `_${key}`;
-        out[normalizedKey] = sanitizeValue(value);
+    // Have some sane minimum limit and theoretical maximum limit for max_chunk_size.
+    // Actual meaningful values depend on network MTU and Graylog components.
+    if (out.max_chunk_size < 64 || out.max_chunk_size > 65475) {
+        plugin.logerror(`${name}: invalid max_chunk_size=${out.max_chunk_size}`);
+        out.enabled = false;
     }
 
     return out;
 }
 
-function normalizeTimestamp(value) {
-    if (value == null) return Date.now() / 1000;
-
-    if (value instanceof Date) return value.getTime() / 1000;
-
-    if (typeof value === 'number') {
-        // Heuristic: convert ms epoch to seconds if needed
-        return value > 1e12 ? value / 1000 : value;
+function stringify(value)
+{
+    if (typeof value === 'string') {
+        return value;
+    } else {
+        return String(value);
     }
-
-    const parsed = Date.parse(value);
-    if (!Number.isNaN(parsed)) return parsed / 1000;
-
-    return Date.now() / 1000;
 }
 
-function normalizeLevel(value, fallback) {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : fallback;
+function jsonify(value)
+{
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return stringify(value);
+    }
 }
 
-function sanitizeValue(value) {
+function sanitizeValue(value)
+{
     if (value instanceof Error) {
         return {
             name: value.name,
@@ -247,32 +90,68 @@ function sanitizeValue(value) {
         return value.toISOString();
     }
 
-    if (
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'boolean'
-    ) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
         return value;
     }
 
-    return safeJson(value);
+    return jsonify(value);
 }
 
-function safeJson(value) {
-    try {
-        return JSON.parse(JSON.stringify(value));
+function normalizeTimestamp(value)
+{
+    if (value instanceof Date) {
+        return value.getTime() / 1000;
+    } else {
+        return Date.now() / 1000;
     }
-    catch (err) {
-        return String(value);
+}
+
+function normalizeMessage(cfg, msg)
+{
+    const out = {
+        version: GELF_VERSION,
+        host: stringify(msg.host || cfg.hostname),
+        short_message: stringify(msg.short_message),
+        full_message: (msg.full_message !== undefined ? stringify(msg.full_message) : undefined),
+        timestamp: normalizeTimestamp(msg.timestamp),
+        level: Number(msg.level),
+        facility: (msg.facility !== undefined ? stringify(msg.facility) : undefined),
+        file: (msg.file !== undefined ? stringify(msg.file) : undefined),
+        line: (msg.line !== undefined ? Number(msg.line) : undefined),
+    };
+
+    // Convert all remaining custom fields to GELF additional fields (_foo).
+    for (const [key, value] of Object.entries(msg)) {
+        const additional_key = key.startsWith('_') ? key : `_${key}`;
+        if (out[additional_key.slice(1)] !== undefined || value === null || value === undefined) {
+            continue;
+        }
+        out[additional_key] = sanitizeValue(value);
     }
+
+    return out;
 }
 
-function stringify(value) {
-    if (typeof value === 'string') return value;
-    return String(value);
-}
+async function sendGelf(plugin, socket, cfg, message)
+{
+    const payload = normalizeMessage(cfg, message);
 
-function sendChunked(plugin, socket, cfg, compressedPayload) {
+    let buffer = Buffer.from(JSON.stringify(payload), 'utf8');
+
+    if (cfg.compress) {
+        buffer = await gzip(buffer);
+    }
+
+    if (buffer.length <= cfg.max_chunk_size) {
+        socket.send(buffer, (err) => {
+            if (err) {
+                // Do not use Haraka logger to avoid log loop
+                console.error(`GELF UDP send failed: ${err.message}`);
+            }
+        });
+        return cfg.last;
+    }
+
     // GELF chunked UDP header:
     // 2 bytes magic + 8 bytes message id + 1 byte seq + 1 byte seq count
     const messageId = crypto.randomBytes(8);
@@ -280,27 +159,21 @@ function sendChunked(plugin, socket, cfg, compressedPayload) {
     const chunkDataSize = cfg.max_chunk_size - headerSize;
 
     if (chunkDataSize <= 0) {
-        if (cfg.log_errors) {
-            plugin.logerror(`invalid max_chunk_size=${cfg.max_chunk_size}`);
-        }
-        return;
+        return cfg.last;
     }
 
-    const chunks = Math.ceil(compressedPayload.length / chunkDataSize);
+    const chunks = Math.ceil(buffer.length / chunkDataSize);
 
     if (chunks > 128) {
-        if (cfg.log_errors) {
-            plugin.logerror(
-                `GELF payload requires ${chunks} chunks, exceeds GELF UDP limit`
-            );
-        }
-        return;
+        // Do not use Haraka logger to avoid log loop
+        console.error(`GELF payload requires ${chunks} chunks, exceeds GELF UDP limit`);
+        return cfg.last;
     }
 
     for (let seq = 0; seq < chunks; seq++) {
         const start = seq * chunkDataSize;
-        const end = Math.min(start + chunkDataSize, compressedPayload.length);
-        const part = compressedPayload.subarray(start, end);
+        const end = Math.min(start + chunkDataSize, buffer.length);
+        const part = buffer.subarray(start, end);
 
         const packet = Buffer.allocUnsafe(headerSize + part.length);
         packet[0] = CHUNK_MAGIC_0;
@@ -310,14 +183,290 @@ function sendChunked(plugin, socket, cfg, compressedPayload) {
         packet[11] = chunks;
         part.copy(packet, headerSize);
 
-        socket.send(packet, cfg.port, cfg.host, onSend(plugin));
+        socket.send(packet, (err) => {
+            if (err) {
+                // Do not use Haraka logger to avoid log loop
+                console.error(`GELF UDP chunk send failed: ${err.message}`);
+            }
+        });
     }
+
+    return cfg.last;
 }
 
-function onSend(plugin) {
-    return (err) => {
-        if (err && plugin.cfg.log_errors) {
-            plugin.logerror(`GELF UDP send failed: ${err.message}`);
+exports.register = function ()
+{
+    const plugin = this;
+
+    plugin.load_gelf_config();
+
+    // Initialize once per Haraka process.
+    plugin.register_hook('init_master', 'init_gelf_sender');
+    plugin.register_hook('init_child', 'init_gelf_sender');
+};
+
+exports.load_gelf_config = function ()
+{
+    const plugin = this;
+
+    const cfg = plugin.config.get(
+        'gelf.ini',
+        {
+            booleans: [
+                '+main.enabled',
+                '+main.compress',
+                '-main.last',
+            ],
+        },
+        () => {
+            plugin.load_gelf_config();
+        }
+    ) || {};
+
+    // Pass through resolveConfig() for validation
+    cfg.main = resolveConfig(plugin, 'main', {
+        enabled: toBool(cfg.main?.enabled, true),
+        url: cfg.main?.url || 'udp://localhost:12201',
+        compress: toBool(cfg.main?.compress, true),
+        last: toBool(cfg.main?.last, false),
+        max_chunk_size: Number(cfg.main?.max_chunk_size || 1420),
+        hostname: cfg.main?.hostname || os.hostname(),
+    });
+
+    const plugins = {};
+    for (const [pluginName, pluginCfg] of Object.entries(cfg.plugins || {})) {
+        if (!pluginCfg || typeof pluginCfg !== 'object') {
+            continue;
+        }
+        plugins[pluginName] = resolveConfig(plugin, `plugins.${pluginName}`, cfg.main, pluginCfg);
+    }
+    cfg.plugins = plugins;
+
+    plugin.cfg = cfg;
+
+    plugin.loginfo("config ok");
+};
+
+exports.init_gelf_sender = function (next, server)
+{
+    const plugin = this;
+
+    if (!server.notes) {
+        server.notes = {};
+    }
+
+    if (server.notes.loggelf) {
+        // Already initialized
+        return next();
+    }
+
+    const sockets = new Map();
+
+    const getConfig = (pluginName) =>
+    {
+        if (plugin.cfg.plugins[pluginName]) {
+            return plugin.cfg.plugins[pluginName];
+        } else {
+            return plugin.cfg.main;
         }
     };
-}
+
+    const resolveUrl = (url) =>
+    {
+        return new Promise((resolve, reject) =>
+        {
+            const { protocol: scheme, hostname, port } = new URL(url);
+
+            const protocol = (scheme ?? 'udp:').slice(0, -1);
+
+            // Find preferred address family by configuration
+            let family = 0;
+            if (protocol === "udp4") {
+                family = 4;
+            } else if (protocol === "udp6") {
+                family = 6;
+            } else if (protocol !== "udp") {
+                reject(new Error(`Invalid protocol: ${protocol}`));
+                return;
+            }
+
+            dns.lookup(hostname, { all: true, family: family, order: 'verbatim' }, (err, addresses) =>
+            {
+                if (err || !addresses || !addresses.length) {
+                    reject(new Error(`GELF UDP host lookup failed: ${hostname}: ${err?.message}`));
+                    return;
+                }
+
+                try {
+                    // Use the family of the first address as the preferred family.
+                    // When there was no preferred family by the configuration, system preference is used by lookup.
+                    // For confused configuration like 'udp6://127.0.0.1', the actual IP address family is used.
+                    family = addresses[0].family;
+
+                    const socket = dgram.createSocket((family === 6 ? 'udp6' : 'udp4'));
+                    socket.on('error', (err) => {
+                        // Do not use Haraka logger to avoid log loop
+                        console.error(`GELF UDP socket error: ${url}: ${err.message}`);
+                    });
+
+                    resolve({
+                        family,
+                        addresses : (addresses.filter(a => a.family === family).map(a => a.address)),
+                        port: (port ? parseInt(port) : 12201),
+                        socket,
+                        send(packet, callback) {
+                            this.socket.send(packet, this.port, this.addresses[Math.floor(Math.random() * this.addresses.length)], callback);
+                        },
+                    });
+                } catch (e) {
+                    reject(new Error(`GELF createSocket failed: ${url}: ${e?.message}`));
+                    return;
+                }
+            });
+        });
+    };
+
+    const getSocket = (url) =>
+    {
+        if (sockets.has(url)) {
+            return sockets.get(url);
+        }
+
+        const promise = resolveUrl(url);
+
+        sockets.set(url, promise);
+
+        return promise;
+    };
+
+    const getScopedSender = async (pluginCfg) =>
+    {
+        const socket = await getSocket(pluginCfg.url);
+
+        return {
+            async message(msg) {
+                return await sendGelf(plugin, socket, pluginCfg, msg);
+            },
+        };
+    };
+
+    server.notes.loggelf = {
+
+        getSender(callerPlugin)
+        {
+            return getScopedSender(getConfig(callerPlugin.name));
+        },
+
+        message(callerPlugin, msg)
+        {
+            const pluginCfg = getConfig(callerPlugin.name);
+
+            getScopedSender(pluginCfg)
+                .then(sender => sender.message(msg))
+                // Do not use Haraka logger to avoid log loop
+                .catch(err => console.error(err));
+
+            return pluginCfg.last;
+        },
+
+        log(callerPlugin, level, shortMessage, extra = {})
+        {
+            return this.message(callerPlugin, {
+                ...extra,
+                short_message: shortMessage,
+                level,
+            });
+        },
+
+        emergency(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.EMERG, shortMessage, extra);
+        },
+
+        alert(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.ALERT, shortMessage, extra);
+        },
+
+        critical(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.CRIT, shortMessage, extra);
+        },
+
+        error(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.ERROR, shortMessage, extra);
+        },
+
+        warning(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.WARN, shortMessage, extra);
+        },
+
+        notice(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.NOTICE, shortMessage, extra);
+        },
+
+        info(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.INFO, shortMessage, extra);
+        },
+
+        debug(callerPlugin, shortMessage, extra = {}) {
+            return this.log(callerPlugin, LogLevel.DEBUG, shortMessage, extra);
+        },
+
+        async close() {
+            for (const promise of sockets.values()) {
+                try {
+                    const conn = await promise;
+                    conn.socket.close();
+                } catch (err) {
+                    plugin.logerror(`socket.close(): ${err.message}`);
+                }
+            }
+            sockets.clear();
+        },
+
+    };
+
+    plugin.loggelf = server.notes.loggelf;
+
+    plugin.loginfo('GELF UDP sender ready');
+
+    next();
+};
+
+exports.hook_log = function (next, logger, log)
+{
+    const plugin = this;
+
+    if (!plugin.loggelf) {
+        return next();
+    }
+
+    const msg = {
+        level: LogLevel[log.level.toUpperCase()] ?? LogLevel.DEBUG,
+        short_message: null,
+        _transaction: null,
+        _logger: null,
+    };
+
+    // Get transaction UUID and caller plugin name from log message
+    const match = log.data.match(/^\[([^\]]+)\] \[([^\]]+)\] \[([^\]]+)\] (.+)$/);
+    if (match) {
+        if (match[2] !== '-') {
+            msg._transaction = match[2];
+        }
+        if (match[3] !== '-') {
+            msg._logger = match[3];
+        }
+        // Remove log level, but keep UUID and plugin name
+        msg.short_message = `[${match[2]}] [${match[3]}] ${match[4]}`;
+    } else {
+        msg.short_message = log.data;
+    }
+
+    const is_last = plugin.loggelf.message(logger, msg);
+
+    if (is_last) {
+        // Skip all following logger plugins
+        return next(OK);
+    } else {
+        return next();
+    }
+};
