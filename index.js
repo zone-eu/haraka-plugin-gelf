@@ -11,6 +11,8 @@ const GELF_VERSION = '1.1';
 const CHUNK_MAGIC_0 = 0x1e;
 const CHUNK_MAGIC_1 = 0x0f;
 
+const RESOLVE_TTL_MS = 60000;
+
 const LogLevel = Object.freeze({
     EMERG:  0,
     ALERT:  1,
@@ -106,7 +108,7 @@ function normalizeTimestamp(value)
     }
 }
 
-function normalizeMessage(cfg, msg)
+function createMessage(cfg, msg)
 {
     const out = {
         version: GELF_VERSION,
@@ -134,7 +136,7 @@ function normalizeMessage(cfg, msg)
 
 async function sendGelf(plugin, socket, cfg, message)
 {
-    const payload = normalizeMessage(cfg, message);
+    const payload = createMessage(cfg, message);
 
     let buffer = Buffer.from(JSON.stringify(payload), 'utf8');
 
@@ -271,6 +273,25 @@ exports.init_gelf_sender = function (next, server)
         }
     };
 
+    const lookup = (hostname, family, cb) =>
+    {
+        dns.lookup(hostname, { all: true, family: family, order: 'verbatim' }, (err, addresses) =>
+        {
+            if (err || !addresses || !addresses.length) {
+                cb(new Error(`GELF UDP host lookup failed: ${hostname}: ${err?.message}`));
+                return;
+            }
+
+            // Use the family of the first address as the preferred family.
+            // When there was no preferred family by the configuration, system preference is used by lookup.
+            // For confused configurations like 'udp6://127.0.0.1', the actual IP address family is used.
+            const resolvedFamily = addresses[0].family;
+            const resolvedAddresses = addresses.filter(a => a.family === resolvedFamily).map(a => a.address);
+
+            cb(null, resolvedFamily, resolvedAddresses);
+        });
+    };
+
     const resolveUrl = (url) =>
     {
         return new Promise((resolve, reject) =>
@@ -280,44 +301,82 @@ exports.init_gelf_sender = function (next, server)
             const protocol = (scheme ?? 'udp:').slice(0, -1);
 
             // Find preferred address family by configuration
-            let family = 0;
+            let cfgFamily = 0;
             if (protocol === "udp4") {
-                family = 4;
+                cfgFamily = 4;
             } else if (protocol === "udp6") {
-                family = 6;
+                cfgFamily = 6;
             } else if (protocol !== "udp") {
                 reject(new Error(`Invalid protocol: ${protocol}`));
                 return;
             }
 
-            dns.lookup(hostname, { all: true, family: family, order: 'verbatim' }, (err, addresses) =>
+            const createSocket = (family) =>
             {
-                if (err || !addresses || !addresses.length) {
-                    reject(new Error(`GELF UDP host lookup failed: ${hostname}: ${err?.message}`));
+                const socket = dgram.createSocket((family === 6 ? 'udp6' : 'udp4'));
+                socket.on('error', (err) => {
+                    // Do not use Haraka logger to avoid log loop
+                    console.error(`GELF UDP socket error: ${url}: ${err.message}`);
+                });
+                return socket;
+            };
+
+            lookup(hostname, cfgFamily, (err, resolvedFamily, resolvedAddresses) =>
+            {
+                if (err) {
+                    reject(err);
                     return;
                 }
 
                 try {
-                    // Use the family of the first address as the preferred family.
-                    // When there was no preferred family by the configuration, system preference is used by lookup.
-                    // For confused configuration like 'udp6://127.0.0.1', the actual IP address family is used.
-                    family = addresses[0].family;
-
-                    const socket = dgram.createSocket((family === 6 ? 'udp6' : 'udp4'));
-                    socket.on('error', (err) => {
-                        // Do not use Haraka logger to avoid log loop
-                        console.error(`GELF UDP socket error: ${url}: ${err.message}`);
-                    });
-
-                    resolve({
-                        family,
-                        addresses : (addresses.filter(a => a.family === family).map(a => a.address)),
+                    const conn = {
+                        family: resolvedFamily,
+                        addresses : resolvedAddresses,
                         port: (port ? parseInt(port) : 12201),
-                        socket,
+                        socket: createSocket(resolvedFamily),
+                        resolvedAt: Date.now(),
                         send(packet, callback) {
-                            this.socket.send(packet, this.port, this.addresses[Math.floor(Math.random() * this.addresses.length)], callback);
+                            if (this.socket) {
+                                this.socket.send(packet, this.port, this.addresses[Math.floor(Math.random() * this.addresses.length)], callback);
+                            }
                         },
-                    });
+                        refresh() {
+                            if (Math.abs(Date.now() - this.resolvedAt) < RESOLVE_TTL_MS) {
+                                return;
+                            }
+
+                            // Mark as fresh immediately to prevent concurrent re-resolves
+                            this.resolvedAt = Date.now();
+
+                            lookup(hostname, cfgFamily, (err, newFamily, newAddresses) =>
+                            {
+                                if (err) {
+                                    console.error(`GELF UDP host lookup failed: ${hostname}: ${err?.message}`);
+                                    return;
+                                }
+
+                                try {
+                                    // Check is socket still exists (it may have been closed while lookup was running)
+                                    if (this.socket) {
+                                        if (this.family !== newFamily) {
+                                            try {
+                                                this.socket.close();
+                                            } catch (e) {
+                                                // Ignore
+                                            }
+                                            this.socket = createSocket(newFamily);
+                                            this.family = newFamily;
+                                        }
+                                        this.addresses = newAddresses;
+                                    }
+                                } catch (e) {
+                                    console.error(`GELF createSocket failed: ${url}: ${e?.message}`);
+                                    return;
+                                }
+                            });
+                        },
+                    };
+                    resolve(conn);
                 } catch (e) {
                     reject(new Error(`GELF createSocket failed: ${url}: ${e?.message}`));
                     return;
@@ -343,6 +402,8 @@ exports.init_gelf_sender = function (next, server)
     {
         const socket = await getSocket(pluginCfg.url);
 
+        socket.refresh();
+
         return {
             async message(msg) {
                 return await sendGelf(plugin, socket, pluginCfg, msg);
@@ -364,7 +425,7 @@ exports.init_gelf_sender = function (next, server)
             getScopedSender(pluginCfg)
                 .then(sender => sender.message(msg))
                 // Do not use Haraka logger to avoid log loop
-                .catch(err => console.error(err));
+                .catch(err => console.error(err.message));
 
             return pluginCfg.last;
         },
@@ -412,12 +473,17 @@ exports.init_gelf_sender = function (next, server)
 
         async close() {
             for (const promise of sockets.values()) {
-                try {
-                    const conn = await promise;
-                    conn.socket.close();
-                } catch (err) {
-                    plugin.logerror(`socket.close(): ${err.message}`);
-                }
+                promise
+                    .then((conn) => {
+                        try {
+                            conn.socket.close();
+                        } catch (err) {
+                            plugin.logerror(`socket.close(): ${err.message}`);
+                        } finally {
+                            conn.socket = null;
+                        }
+                    })
+                    .catch(err => console.error(err.message));
             }
             sockets.clear();
         },
