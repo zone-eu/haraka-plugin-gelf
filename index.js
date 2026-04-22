@@ -266,7 +266,7 @@ exports.init_gelf_sender = function (next, server)
 
     const getConfig = (pluginName) =>
     {
-        if (plugin.cfg.plugins[pluginName]) {
+        if (pluginName && plugin.cfg.plugins[pluginName]) {
             return plugin.cfg.plugins[pluginName];
         } else {
             return plugin.cfg.main;
@@ -415,12 +415,12 @@ exports.init_gelf_sender = function (next, server)
 
         getSender(callerPlugin)
         {
-            return getScopedSender(getConfig(callerPlugin.name));
+            return getScopedSender(getConfig(callerPlugin?.name));
         },
 
         message(callerPlugin, msg)
         {
-            const pluginCfg = getConfig(callerPlugin.name);
+            const pluginCfg = getConfig(callerPlugin?.name);
 
             getScopedSender(pluginCfg)
                 .then(sender => sender.message(msg))
@@ -430,45 +430,47 @@ exports.init_gelf_sender = function (next, server)
             return pluginCfg.last;
         },
 
-        log(callerPlugin, level, shortMessage, extra = {})
+        log(callerPlugin, connection, level, shortMessage, extra = {})
         {
             return this.message(callerPlugin, {
                 ...extra,
-                short_message: shortMessage,
                 level,
+                short_message: shortMessage,
+                _logger: callerPlugin?.name,
+                _transaction: connection?.uuid,
             });
         },
 
-        emergency(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.EMERG, shortMessage, extra);
+        emergency(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.EMERG, shortMessage, extra);
         },
 
-        alert(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.ALERT, shortMessage, extra);
+        alert(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.ALERT, shortMessage, extra);
         },
 
-        critical(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.CRIT, shortMessage, extra);
+        critical(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.CRIT, shortMessage, extra);
         },
 
-        error(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.ERROR, shortMessage, extra);
+        error(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.ERROR, shortMessage, extra);
         },
 
-        warning(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.WARN, shortMessage, extra);
+        warning(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.WARN, shortMessage, extra);
         },
 
-        notice(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.NOTICE, shortMessage, extra);
+        notice(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.NOTICE, shortMessage, extra);
         },
 
-        info(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.INFO, shortMessage, extra);
+        info(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.INFO, shortMessage, extra);
         },
 
-        debug(callerPlugin, shortMessage, extra = {}) {
-            return this.log(callerPlugin, LogLevel.DEBUG, shortMessage, extra);
+        debug(callerPlugin, connection, shortMessage, extra = {}) {
+            return this.log(callerPlugin, connection, LogLevel.DEBUG, shortMessage, extra);
         },
 
         async close() {

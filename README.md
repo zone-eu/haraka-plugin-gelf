@@ -79,7 +79,7 @@ The `url` setting controls both the transport endpoint and the preferred address
 
 When a hostname resolves to multiple addresses of the same family, each message is sent to a randomly selected address, providing basic load distribution.
 
-DNS is re-resolved in the background every 10 seconds. Sends are never delayed waiting for re-resolution — the previous addresses remain in use until the new resolution completes.
+DNS is re-resolved in the background every 60 seconds. Sends are never delayed waiting for re-resolution — the previous addresses remain in use until the new resolution completes.
 
 ## API for other plugins
 
