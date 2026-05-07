@@ -264,8 +264,8 @@ exports.load_gelf_config = function ()
 {
     const plugin = this;
 
-    const cfg = plugin.config.get(
-        'gelf.ini',
+    const yaml = plugin.config.get(
+        'gelf.yaml',
         {
             booleans: [
                 '+main.enabled',
@@ -279,20 +279,22 @@ exports.load_gelf_config = function ()
         }
     ) || {};
 
+    let cfg = {};
+
     // Pass through resolveConfig() for validation
     cfg.main = resolveConfig(plugin, 'main', {
-        enabled: toBool(cfg.main?.enabled, true),
-        log_hook_enabled: toBool(cfg.main?.log_hook_enabled, true),
-        url: cfg.main?.url || 'udp://localhost:12201',
-        compress: toBool(cfg.main?.compress, true),
-        last: toBool(cfg.main?.last, false),
-        max_chunk_size: Number(cfg.main?.max_chunk_size || 1420),
-        hostname: cfg.main?.hostname || os.hostname(),
-        fields: cfg.main?.fields || {},
+        enabled: toBool(yaml.enabled, true),
+        log_hook_enabled: toBool(yaml.log_hook_enabled, true),
+        url: yaml.url || 'udp://localhost:12201',
+        compress: toBool(yaml.compress, true),
+        last: toBool(yaml.last, false),
+        max_chunk_size: Number(yaml.max_chunk_size || 1420),
+        hostname: yaml.hostname || os.hostname(),
+        fields: yaml.fields || {},
     });
 
     const plugins = {};
-    for (const [pluginName, pluginCfg] of Object.entries(cfg.plugins || {})) {
+    for (const [pluginName, pluginCfg] of Object.entries(yaml.plugins || {})) {
         if (!pluginCfg || typeof pluginCfg !== 'object') {
             continue;
         }
